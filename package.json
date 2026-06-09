@@ -1,0 +1,14 @@
+{
+  "name": "disco-ch-proxy",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker proxy for DISCO — keeps Companies House API key server-side",
+  "main": "worker.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
