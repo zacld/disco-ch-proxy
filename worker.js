@@ -1,158 +1,186 @@
 /**
- * DISCO — Companies House Proxy Worker
- * Cloudflare Worker that proxies Companies House API requests server-side,
- * keeping the API key out of the frontend entirely.
+ * DISCO — Companies House Proxy Worker v1.1
  *
- * Deploy with: wrangler deploy
- * Set secret:  wrangler secret put CH_API_KEY
- *
- * Allowed routes (read-only, no writes):
- *   GET /search/companies?q=...&items_per_page=...
- *   GET /company/:number
- *   GET /company/:number/officers
- *   GET /company/:number/filing-history
- *
- * The frontend (GitHub Pages) origin is allowed via CORS.
- * All other routes and methods are rejected.
+ * Changes from v1.0:
+ * - CORS: reject unrecognised origins with 403, not silently allow them
+ * - Rate limit: tighter per-IP budget (30/min) + global budget guard (200/min)
+ *   to avoid exhausting the CH free tier during bulk lookups
+ * - Added /company/:number/advanced-search route for future use
+ * - Explicit no-cache on 4xx/5xx responses
+ * - Worker-level request counter resets on isolation recycle (noted in comment)
  */
 
-// ── Allowed routes — whitelist only, no arbitrary proxying
+const ALLOWED_ORIGINS = new Set([
+  'https://zacld.github.io',
+  'http://localhost:3000',
+  'http://localhost:5173',
+]);
+
 const ALLOWED_ROUTES = [
-  { pattern: /^\/search\/companies$/, method: 'GET' },
-  { pattern: /^\/company\/[A-Z0-9]{6,10}$/, method: 'GET' },
-  { pattern: /^\/company\/[A-Z0-9]{6,10}\/officers$/, method: 'GET' },
-  { pattern: /^\/company\/[A-Z0-9]{6,10}\/filing-history$/, method: 'GET' },
+  { pattern: /^\/search\/companies$/,                      method: 'GET' },
+  { pattern: /^\/advanced-search\/companies$/,             method: 'GET' },
+  { pattern: /^\/company\/[A-Z0-9]{6,10}$/,               method: 'GET' },
+  { pattern: /^\/company\/[A-Z0-9]{6,10}\/officers$/,     method: 'GET' },
+  { pattern: /^\/company\/[A-Z0-9]{6,10}\/filing-history$/,method: 'GET' },
 ];
 
-// ── Allowed query params per route (blocklist everything else)
-const ALLOWED_PARAMS = ['q', 'items_per_page', 'start_index', 'register_type', 'order_by', 'category'];
+const ALLOWED_PARAMS = [
+  'q', 'items_per_page', 'start_index', 'register_type',
+  'order_by', 'category', 'sic_codes', 'company_status', 'company_type', 'size',
+];
 
-// ── Rate limiting — simple in-memory per-IP counter (resets on worker restart)
-// For production, use Cloudflare KV or Durable Objects for persistence
-const rateLimitMap = new Map();
-const RATE_LIMIT = 60;       // requests per window
-const RATE_WINDOW_MS = 60000; // 1 minute
+// ── Per-IP rate limit (in-memory; resets on worker isolation recycle)
+const perIpMap = new Map();
+const PER_IP_LIMIT    = 30;    // requests per IP per minute
+const RATE_WINDOW_MS  = 60_000;
+
+// ── Global budget guard — prevents bulk CH exhaustion
+// CH free tier: 600 req/min. We reserve headroom for other tools.
+let globalCount = 0;
+let globalWindowStart = Date.now();
+const GLOBAL_LIMIT = 200; // max requests this worker will forward per minute
 
 function checkRateLimit(ip) {
   const now = Date.now();
-  const entry = rateLimitMap.get(ip) || { count: 0, windowStart: now };
+
+  // Reset global window
+  if (now - globalWindowStart > RATE_WINDOW_MS) {
+    globalCount = 0;
+    globalWindowStart = now;
+  }
+  globalCount++;
+  if (globalCount > GLOBAL_LIMIT) return { ok: false, reason: 'global_budget' };
+
+  // Per-IP window
+  const entry = perIpMap.get(ip) || { count: 0, windowStart: now };
   if (now - entry.windowStart > RATE_WINDOW_MS) {
     entry.count = 1;
     entry.windowStart = now;
   } else {
-    entry.count += 1;
+    entry.count++;
   }
-  rateLimitMap.set(ip, entry);
-  return entry.count <= RATE_LIMIT;
+  perIpMap.set(ip, entry);
+  if (entry.count > PER_IP_LIMIT) return { ok: false, reason: 'per_ip' };
+
+  return { ok: true };
 }
 
-// ── CORS headers — restrict to GitHub Pages origin
 function corsHeaders(origin) {
-  const allowed = [
-    'https://zacld.github.io',
-    'http://localhost:3000',    // local dev
-    'http://localhost:5173',    // vite dev
-  ];
-  const allowedOrigin = allowed.includes(origin) ? origin : allowed[0];
+  // Only emit CORS headers for known origins.
+  // Returning nothing for unknown origins causes browsers to block the response.
+  if (!ALLOWED_ORIGINS.has(origin)) return {};
   return {
-    'Access-Control-Allow-Origin': allowedOrigin,
+    'Access-Control-Allow-Origin':  origin,
     'Access-Control-Allow-Methods': 'GET, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Max-Age': '86400',
+    'Access-Control-Max-Age':       '86400',
+    'Vary':                         'Origin',
   };
 }
 
-function jsonResponse(body, status, origin) {
+function jsonResponse(body, status, origin, extraHeaders = {}) {
   return new Response(JSON.stringify(body), {
     status,
     headers: {
       'Content-Type': 'application/json',
       ...corsHeaders(origin),
+      ...extraHeaders,
     },
   });
 }
 
-// ── Main handler
 export default {
   async fetch(request, env) {
     const origin = request.headers.get('Origin') || '';
-    const url = new URL(request.url);
-    const pathname = url.pathname;
+    const url    = new URL(request.url);
+    const path   = url.pathname;
 
-    // Handle preflight
+    // Preflight
     if (request.method === 'OPTIONS') {
+      if (!ALLOWED_ORIGINS.has(origin)) {
+        return new Response(null, { status: 403 });
+      }
       return new Response(null, { status: 204, headers: corsHeaders(origin) });
     }
 
-    // Only GET allowed
+    // Method guard
     if (request.method !== 'GET') {
       return jsonResponse({ error: 'Method not allowed' }, 405, origin);
     }
 
-    // Rate limiting
-    const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
-    if (!checkRateLimit(ip)) {
-      return jsonResponse({ error: 'Rate limit exceeded' }, 429, origin);
+    // Origin guard — reject unknown callers before touching the CH key
+    if (!ALLOWED_ORIGINS.has(origin)) {
+      return jsonResponse({ error: 'Origin not permitted' }, 403, origin);
     }
 
-    // Route validation — must match whitelist exactly
-    const routeMatch = ALLOWED_ROUTES.find(r =>
-      r.method === request.method && r.pattern.test(pathname)
+    // Rate limiting
+    const ip  = request.headers.get('CF-Connecting-IP') || 'unknown';
+    const rl  = checkRateLimit(ip);
+    if (!rl.ok) {
+      return jsonResponse(
+        { error: 'Rate limit exceeded', reason: rl.reason },
+        429, origin,
+        { 'Retry-After': '60' }
+      );
+    }
+
+    // Route whitelist
+    const routeMatch = ALLOWED_ROUTES.find(
+      r => r.method === request.method && r.pattern.test(path)
     );
     if (!routeMatch) {
-      return jsonResponse({ error: 'Route not permitted', path: pathname }, 403, origin);
+      return jsonResponse({ error: 'Route not permitted', path }, 403, origin);
     }
 
-    // Strip disallowed query params
-    const cleanParams = new URLSearchParams();
-    for (const [key, value] of url.searchParams.entries()) {
-      if (ALLOWED_PARAMS.includes(key)) {
-        cleanParams.set(key, value);
-      }
+    // Sanitise query params
+    const clean = new URLSearchParams();
+    for (const [k, v] of url.searchParams) {
+      if (ALLOWED_PARAMS.includes(k)) clean.set(k, v);
     }
 
-    // Build Companies House API URL
-    const chBase = 'https://api.company-information.service.gov.uk';
-    const chUrl = `${chBase}${pathname}${cleanParams.toString() ? '?' + cleanParams.toString() : ''}`;
-
-    // Add CH API key via HTTP Basic Auth (key as username, empty password)
+    // CH API key must be present
     const apiKey = env.CH_API_KEY;
     if (!apiKey) {
-      return jsonResponse({ error: 'Companies House API key not configured on proxy' }, 503, origin);
+      return jsonResponse({ error: 'CH_API_KEY not configured' }, 503, origin);
     }
-    const basicAuth = btoa(`${apiKey}:`);
 
-    // Forward to Companies House
-    let chResponse;
+    const chUrl = `https://api.company-information.service.gov.uk${path}${
+      clean.toString() ? '?' + clean.toString() : ''
+    }`;
+
+    let chResp;
     try {
-      chResponse = await fetch(chUrl, {
+      chResp = await fetch(chUrl, {
         method: 'GET',
         headers: {
-          'Authorization': `Basic ${basicAuth}`,
-          'Accept': 'application/json',
-          'User-Agent': 'DISCO-FX-Proxy/1.0',
+          'Authorization': `Basic ${btoa(apiKey + ':')}`,
+          'Accept':        'application/json',
+          'User-Agent':    'DISCO-FX-Proxy/1.1',
         },
       });
     } catch (e) {
       return jsonResponse({ error: 'Upstream request failed', detail: e.message }, 502, origin);
     }
 
-    // Parse and forward response
     let data;
     try {
-      data = await chResponse.json();
-    } catch (e) {
-      return jsonResponse({ error: 'Invalid response from Companies House' }, 502, origin);
+      data = await chResp.json();
+    } catch {
+      return jsonResponse({ error: 'Invalid upstream response' }, 502, origin);
     }
 
-    // Strip any internal CH fields we don't need (defence in depth)
-    // Only forward known safe fields
+    // Forward response — cache successes, no-store errors
+    const isOk     = chResp.status >= 200 && chResp.status < 300;
+    const cacheHdr = isOk
+      ? { 'Cache-Control': 'public, max-age=3600' }
+      : { 'Cache-Control': 'no-store' };
+
     return new Response(JSON.stringify(data), {
-      status: chResponse.status,
+      status: chResp.status,
       headers: {
         'Content-Type': 'application/json',
-        'Cache-Control': 'public, max-age=3600', // cache CH data for 1 hour
         ...corsHeaders(origin),
+        ...cacheHdr,
       },
     });
   },
